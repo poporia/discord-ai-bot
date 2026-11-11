@@ -1,0 +1,6 @@
+# シークレット(.env)はイメージに入れない
+.env
+__pycache__/
+*.pyc
+.git
+fly.toml

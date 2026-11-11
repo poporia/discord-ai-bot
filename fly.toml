@@ -1,0 +1,9 @@
+# Fly.io 設定 — app名を自分のものに変更してください
+app = "my-discord-ai-bot"
+primary_region = "nrt"   # 東京リージョン
+
+[build]
+  dockerfile = "Dockerfile"
+
+# Discordボットは常駐ワーカー(HTTPサーバーではない)なので
+# services設定は不要。1台のまま運用すること(複数台だと二重返信します)
