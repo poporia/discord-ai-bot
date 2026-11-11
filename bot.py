@@ -26,6 +26,11 @@ try:
 except ImportError:
     dice = None
 
+try:
+    import songdb
+except ImportError:
+    songdb = None
+
 load_dotenv()
 
 # ---------------- 設定(.env で上書き可能) ----------------
@@ -180,6 +185,19 @@ async def on_message(message: discord.Message):
             await ch.send("\n".join(rolls[:5]))  # 多種併記は最初の5個まで
             return
 
+    # 1.3) 音ゲー定数検索(「!定数 曲名」/ 「定数」を含む発言の曲名を照合)
+    if songdb is not None:
+        s = message.content.strip()
+        if s.startswith("!定数"):
+            reply = songdb.query(s)
+            await ch.send(reply or "その曲はデータになかったよ…ごめんね")
+            return
+        if "定数" in message.content:
+            reply = songdb.query(message.content)
+            if reply:
+                await ch.send(reply)
+                return
+
     # 1.5) ゴママヨ検出(LLM不要・即座に反応)
     if gomamayo is not None:
         # ランキング / ランダム再生コマンド
@@ -236,7 +254,33 @@ async def on_message(message: discord.Message):
         await ch.send(reply)
 
 
+def _start_health_server():
+    """RenderなどPaaS用: PORTが指定されていたらヘルスチェック用HTTPサーバーを立てる
+    (外部から10分おきに叩かれることでスリープしなくなる)"""
+    # RenderはPORTを設定しないこともあるので、未指定なら10000で開く
+    port = int(os.environ.get("PORT", "0") or 0) or 10000
+    if not port:
+        return
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Health(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+
+        def log_message(self, *a):
+            pass
+
+    t = threading.Thread(
+        target=HTTPServer(("0.0.0.0", port), Health).serve_forever, daemon=True)
+    t.start()
+    log.info("ヘルスチェックサーバーを port %d で起動", port)
+
+
 if __name__ == "__main__":
     if not LLM_API_KEY:
         log.warning("LLM_API_KEY が未設定です。返信生成が失敗します")
+    _start_health_server()
     client.run(DISCORD_TOKEN)
