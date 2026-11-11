@@ -6,6 +6,7 @@ Discord AI チャットボット
 - トリガーワードに確率で自然に割り込み(クールダウン付き)
 必要: Python 3.10+ / pip install -r requirements.txt
 """
+import asyncio
 import logging
 import os
 import random
@@ -13,6 +14,7 @@ import re
 import time
 
 import discord
+from discord.ext import tasks
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -50,6 +52,14 @@ GOMAMAYO_COOLDOWN = float(os.environ.get("GOMAMAYO_COOLDOWN", "60"))    # 同一
 GOMAMAYO_EMOJI = os.environ.get("GOMAMAYO_EMOJI", "⁉️")            # ゴママヨ検出時のリアクション
 AUTO_REPLY = os.environ.get("AUTO_REPLY", "1") == "1"              # トリガー外でも、自分で「参加したい」と判断したら返す
 AUTO_REPLY_COOLDOWN = float(os.environ.get("AUTO_REPLY_COOLDOWN", "90"))  # 自発返信の最短間隔(秒・チャンネルごと)
+MONOLOGUE = os.environ.get("MONOLOGUE", "1") == "1"                # ごくまれにひとりごとを言う
+MONOLOGUE_PROB = float(os.environ.get("MONOLOGUE_PROB", "0.05"))   # 10分ごとの判定で実行する確率
+MONOLOGUE_COOLDOWN = float(os.environ.get("MONOLOGUE_COOLDOWN", "7200"))  # ひとりごとの最短間隔(秒)
+MONOLOGUE_CHANNEL_ID = int(os.environ.get("MONOLOGUE_CHANNEL_ID", "0") or 0)  # 指定すればそのチャンネル限定
+MONOLOGUE_ACTIVITY_WINDOW = float(os.environ.get("MONOLOGUE_ACTIVITY_WINDOW", "21600"))  # 直近人が話した期間(秒)だけ対象
+LEARN = os.environ.get("LEARN", "1") == "1"            # サーバーの話し方を「記憶ノート」に吸収させる
+LEARN_FILE = os.environ.get("LEARN_FILE", "learned.txt")
+LEARN_EVERY = int(os.environ.get("LEARN_EVERY", "30"))  # 人間の発言この数ごとに記憶を更新
 MAX_CONTEXT = int(os.environ.get("MAX_CONTEXT", "10"))             # 文脈として読む直近メッセージ数
 MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "300"))    # 返信の最大文字数
 
@@ -75,6 +85,10 @@ client = discord.Client(intents=intents)
 last_interject: dict[int, float] = {}
 last_gomamayo: dict[int, float] = {}
 last_auto: dict[int, float] = {}
+last_monologue = 0.0          # 最後にひとりごと言った時刻
+last_seen_channel = None      # 人間が最後に発言したチャンネル
+last_seen_time = 0.0          # その時刻
+human_msg_count = 0           # 学習トリガー用カウンタ
 interject_enabled: dict[int, bool] = {}
 
 
@@ -109,12 +123,27 @@ def hit_trigger(text: str):
     return None
 
 
+def learned_notes() -> str:
+    """記憶ノート(サーバーで吸収した言葉遣い・話題)を読む"""
+    try:
+        with open(LEARN_FILE, encoding="utf-8") as f:
+            return f.read().strip()[:1500]
+    except FileNotFoundError:
+        return ""
+
+
 async def build_messages(channel, message: discord.Message) -> list:
-    msgs = [{"role": "system",
-             "content": load_persona()
-             + f"\nあなたの表示名は「{BOT_NAME}」です。"
-             + "\n返信には名前やプレフィックス(例: 「エージェント: 〜」)を付けず、"
-               "発言の本文だけをそのまま出力すること。"}]
+    sys_text = (load_persona()
+                + f"\nあなたの表示名は「{BOT_NAME}」です。"
+                + "\n返信には名前やプレフィックス(例: 「エージェント: 〜」)を付けず、"
+                  "発言の本文だけをそのまま出力すること。")
+    notes = learned_notes()
+    if notes:
+        sys_text += ("\n\n【あなたがこのサーバーで暮らす中で自然に身につけた記憶】\n"
+                     + notes
+                     + "\n(この内容をそのまま引用せず、口調や話題の好みとして"
+                       "自然に染み込ませること)")
+    msgs = [{"role": "system", "content": sys_text}]
     history = [m async for m in channel.history(limit=MAX_CONTEXT, before=message)]
     history.reverse()
     for m in history:
@@ -174,9 +203,102 @@ async def wants_to_reply(channel, message: discord.Message) -> bool:
         return False
 
 
+async def update_memory(channel):
+    """人間の発言がある程度貯まったら、LLMに「記憶ノート」を書かせて保存する"""
+    try:
+        history = [m async for m in channel.history(limit=80)]
+        lines = [f"{m.author.display_name}「{clean(m.content)[:100]}」"
+                 for m in reversed(history)
+                 if m.content and not m.author.bot]
+        if len(lines) < 10:
+            return
+        prev = learned_notes()
+        sys_prompt = ("あなたはDiscord住人「ミア」の記憶を管理する編集者です。"
+                      "下の会話ログを読み、ミアが自然に吸収すべきことを『記憶ノート』として"
+                      "箇条書きで書いてください(最大8行・全体500字以内)。"
+                      "書くこと: みんながよく使う言葉やネタ、話題の傾向、"
+                      "メンバーの口調の特徴、覚えておくと良さそうな出来事。"
+                      "発言をそのまま書き写さず、特徴だけを抽出すること。"
+                      "前回のノートがある場合はそれを引き継ぎ、古くなった項目は消してよい。")
+        user_prompt = ""
+        if prev:
+            user_prompt += f"【前回の記憶ノート】\n{prev}\n\n"
+        user_prompt += "【最近の会話ログ】\n" + "\n".join(lines)
+        resp = await ai.chat.completions.create(
+            model=LLM_MODEL,
+            messages=[{"role": "system", "content": sys_prompt},
+                      {"role": "user", "content": user_prompt}],
+            max_tokens=400, temperature=0.5)
+        text = (resp.choices[0].message.content or "").strip()
+        if text:
+            with open(LEARN_FILE, "w", encoding="utf-8") as f:
+                f.write(text)
+            log.info("記憶ノートを更新しました(%d文字)", len(text))
+    except Exception:
+        log.exception("記憶ノートの更新に失敗しました")
+
+
+async def generate_monologue(channel):
+    """ひとりごと生成: 誰宛でもない、ぼそっと一言"""
+    try:
+        mono_sys = (load_persona()
+                    + "\nいま誰もあなたに話しかけていません。返事ではなく、"
+                      "ぼそっとひとりごと言ってください。"
+                      "ルール: 1〜2文・日本語・名前やプレフィックスなし・"
+                      "誰かの発言への返答にしない。直近の話題をふと思い出す感じでOK。")
+        notes = learned_notes()
+        if notes:
+            mono_sys += "\n\n【身につけた記憶(口調や話題として染み込ませる)】\n" + notes
+        msgs = [{"role": "system", "content": mono_sys}]
+        history = [m async for m in channel.history(limit=5)]
+        ctx = "\n".join(f"{m.author.display_name}「{clean(m.content)}」"
+                        for m in reversed(history) if m.content)
+        if ctx:
+            msgs.append({"role": "user", "content":
+                         f"チャンネルの最近の様子:\n{ctx}\n\n"
+                         "(返信ではなく、あなたのひとりごとだけを出力)"})
+        resp = await ai.chat.completions.create(
+            model=LLM_MODEL, messages=msgs, max_tokens=100, temperature=1.1)
+        text = (resp.choices[0].message.content or "").strip()
+        return text or None
+    except Exception:
+        log.exception("ひとりごとの生成に失敗しました")
+        return None
+
+
+def monologue_target():
+    """ひとりごとの投稿先: 指定チャンネル or 人間が最後に話したチャンネル"""
+    if MONOLOGUE_CHANNEL_ID:
+        return client.get_channel(MONOLOGUE_CHANNEL_ID)
+    return last_seen_channel
+
+
+@tasks.loop(minutes=10)
+async def monologue_loop():
+    """10分おきにサイコロを振り、ごくまれにひとりごとを言う"""
+    global last_monologue
+    if not MONOLOGUE:
+        return
+    if time.time() - last_seen_time > MONOLOGUE_ACTIVITY_WINDOW:
+        return  # 誰も話してないサーバーで独り言は言わない(無駄打ち防止)
+    ch = monologue_target()
+    if ch is None or not interject_enabled.get(ch.id, True):
+        return
+    if time.time() - last_monologue < MONOLOGUE_COOLDOWN:
+        return
+    if random.random() > MONOLOGUE_PROB:
+        return
+    reply = await generate_monologue(ch)
+    if reply:
+        await ch.send(reply)
+        last_monologue = time.time()
+
+
 @client.event
 async def on_ready():
     log.info("ログインしました: %s (参加サーバー数: %d)", client.user, len(client.guilds))
+    if not monologue_loop.is_running():
+        monologue_loop.start()
 
 
 @client.event
@@ -184,6 +306,17 @@ async def on_message(message: discord.Message):
     if message.author.bot or message.guild is None:
         return
     ch = message.channel
+
+    # ひとりごとの投稿先候補: 人間の発言があった場所と時刻を覚えておく
+    global last_seen_channel, last_seen_time, human_msg_count
+    last_seen_channel = ch
+    last_seen_time = time.time()
+
+    # 学習: 人間の発言が LEARN_EVERY 件貯まったら記憶ノートを更新(裏で非同期に走る)
+    human_msg_count += 1
+    if LEARN and human_msg_count >= LEARN_EVERY:
+        human_msg_count = 0
+        asyncio.create_task(update_memory(ch))
 
     # チャンネル内コマンド
     if message.content.strip().startswith("!ai"):
@@ -197,7 +330,9 @@ async def on_message(message: discord.Message):
         else:
             state = "ON" if interject_enabled.get(ch.id, True) else "OFF"
             goma = "使える" if gomamayo else "無効(モジュール不足)"
-            await ch.send(f"稼働中 / 割り込み: {state} / ゴママヨ検出: {goma} / トリガー: {', '.join(TRIGGER_WORDS)}")
+            mono = "使える" if MONOLOGUE else "オフ"
+            learn = "使える" if LEARN else "オフ"
+            await ch.send(f"稼働中 / 割り込み: {state} / ゴママヨ検出: {goma} / ひとりごと: {mono} / 学習: {learn} / トリガー: {', '.join(TRIGGER_WORDS)}")
         return
 
     # 1.2) ダイスロール(「1d100」などの表記。明示的な意図なので最優先に反応)
