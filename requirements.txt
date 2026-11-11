@@ -3,5 +3,5 @@ openai>=1.30
 python-dotenv>=1.0
 janome>=0.5
 jaconv>=0.3
-alkana>=0.1
+alkana
 httpx>=0.27
