@@ -48,6 +48,8 @@ INTERJECT_COOLDOWN = float(os.environ.get("INTERJECT_COOLDOWN", "90"))  # 同一
 GOMAMAYO_PROB = float(os.environ.get("GOMAMAYO_PROB", "0.5"))      # ゴママヨ検出時に返信する確率(絵文字は常に)
 GOMAMAYO_COOLDOWN = float(os.environ.get("GOMAMAYO_COOLDOWN", "60"))    # 同一チャンネルの最短ゴママヨ返信間隔(秒)
 GOMAMAYO_EMOJI = os.environ.get("GOMAMAYO_EMOJI", "⁉️")            # ゴママヨ検出時のリアクション
+AUTO_REPLY = os.environ.get("AUTO_REPLY", "1") == "1"              # トリガー外でも、自分で「参加したい」と判断したら返す
+AUTO_REPLY_COOLDOWN = float(os.environ.get("AUTO_REPLY_COOLDOWN", "90"))  # 自発返信の最短間隔(秒・チャンネルごと)
 MAX_CONTEXT = int(os.environ.get("MAX_CONTEXT", "10"))             # 文脈として読む直近メッセージ数
 MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "300"))    # 返信の最大文字数
 
@@ -72,6 +74,7 @@ client = discord.Client(intents=intents)
 # チャンネルごとの状態
 last_interject: dict[int, float] = {}
 last_gomamayo: dict[int, float] = {}
+last_auto: dict[int, float] = {}
 interject_enabled: dict[int, bool] = {}
 
 
@@ -150,6 +153,25 @@ async def generate_reply(channel, message: discord.Message):
     except Exception:
         log.exception("LLM呼び出しに失敗しました")
         return None
+
+
+async def wants_to_reply(channel, message: discord.Message) -> bool:
+    """AUTO_REPLY用: ミア自身に「この会話に参加したい?」と YES/NO で聞く"""
+    try:
+        msgs = await build_messages(channel, message)
+        msgs[0] = {"role": "system", "content": (
+            "あなたはDiscordサーバーの住人「ミア」です。"
+            "直近の会話を読み、あなた自身が自然に参加したいかを判断してください。"
+            "反応したい/一言ある/教えたい、なら YES。"
+            "他人同士のやり取りで入る余地がない、特に言うことがない、なら NO。"
+            "出力は YES か NO の一語のみ。")}
+        resp = await ai.chat.completions.create(
+            model=LLM_MODEL, messages=msgs,
+            max_tokens=5, temperature=0.0)
+        return "YES" in (resp.choices[0].message.content or "").upper()
+    except Exception:
+        log.exception("自発返信の判定に失敗しました")
+        return False
 
 
 @client.event
@@ -239,19 +261,36 @@ async def on_message(message: discord.Message):
             await ch.send(reply, mention_author=False)
         return
 
-    # 2.5) トリガーワードに確率で割り込み
+    # 2.5) 自然な割り込み系(!ai off で両方止まる)
     if not interject_enabled.get(ch.id, True):
         return
-    if not hit_trigger(message.content):
+
+    # 2.5a) トリガーワードに確率で割り込み(判定なしの即答ルート)
+    if hit_trigger(message.content):
+        if time.time() - last_interject.get(ch.id, 0) < INTERJECT_COOLDOWN:
+            return
+        if random.random() > INTERJECT_PROB:
+            return
+        last_interject[ch.id] = time.time()
+        reply = await generate_reply(ch, message)
+        if reply:
+            await ch.send(reply)
         return
-    if time.time() - last_interject.get(ch.id, 0) < INTERJECT_COOLDOWN:
+
+    # 2.5b) 自発返信: トリガー外でも、ミア自身に「参加したい?」と聞いてYESなら返す
+    if not AUTO_REPLY:
         return
-    if random.random() > INTERJECT_PROB:
+    if time.time() - last_auto.get(ch.id, 0) < AUTO_REPLY_COOLDOWN:
         return
-    last_interject[ch.id] = time.time()
-    reply = await generate_reply(ch, message)
-    if reply:
-        await ch.send(reply)
+    if len(message.content.strip()) <= 2:  # 「w」等の短文は判定する価値なし
+        return
+    if message.content.strip().startswith("!"):  # 謎コマンドには反応しない
+        return
+    if await wants_to_reply(ch, message):
+        last_auto[ch.id] = time.time()
+        reply = await generate_reply(ch, message)
+        if reply:
+            await ch.send(reply)
 
 
 def _start_health_server():
