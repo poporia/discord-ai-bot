@@ -16,6 +16,7 @@ import time
 from datetime import datetime, timedelta, timezone
 
 import discord
+from discord import app_commands
 from discord.ext import tasks
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -108,10 +109,13 @@ ai = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 intents = discord.Intents.default()
 intents.message_content = True  # Developer Portal での有効化が必要
 client = discord.Client(intents=intents)
+tree = app_commands.CommandTree(client)  # スラッシュコマンド
 
 # チャンネルごとの状態
 last_interject: dict[int, float] = {}
 last_gomamayo: dict[int, float] = {}
+goma_break = False                  # /break 中は全チャンネルで黙る
+goma_channel_off: set[int] = set()  # /channelsetting off されたチャンネル
 last_auto: dict[int, float] = {}
 learn_enabled: dict[int, bool] = {}  # チャンネルごとの学習ON/OFF(!ai learn off)
 allowed_channels: set[int] = set(ALLOWED_CHANNEL_IDS)  # 発言許可チャンネル(Envで固定 or メンションで自動追加)
@@ -495,6 +499,8 @@ async def gomamayo_check(ch, message: discord.Message) -> bool:
     """ゴママヨ検出: ヒットしたら⁉️+指摘文。何か送信したら True"""
     if gomamayo is None:
         return False
+    if goma_break or ch.id in goma_channel_off:
+        return False  # /break 中 or このチャンネルは黙る設定
     df = (gomamayo.detect(message.content)
           if interject_enabled.get(ch.id, True) else None)
     if df is None:
@@ -521,9 +527,54 @@ async def gomamayo_check(ch, message: discord.Message) -> bool:
     return True
 
 
+# ---- スラッシュコマンド(ゴママヨ指摘のON/OFF制御) ----
+# 実行できるのは「サーバー管理権限を持つ人」のみ
+
+@tree.command(name="channelsetting", description="このチャンネルでのゴママヨ指摘をON/OFF")
+@app_commands.describe(channel="対象チャンネル", mode="on: 指摘する / off: 黙る")
+@app_commands.choices(mode=[
+    app_commands.Choice(name="on(指摘する)", value="on"),
+    app_commands.Choice(name="off(黙る)", value="off"),
+])
+@app_commands.default_permissions(manage_guild=True)
+async def cmd_channelsetting(interaction: discord.Interaction,
+                             channel: discord.TextChannel, mode: str):
+    if mode == "off":
+        goma_channel_off.add(channel.id)
+        msg = f"{channel.mention} では黙ります。"
+    else:
+        goma_channel_off.discard(channel.id)
+        msg = f"{channel.mention} で指摘を再開します。"
+    await interaction.response.send_message(msg)
+
+
+@tree.command(name="break", description="全チャンネルで発言を止める(個別設定は保持される)")
+@app_commands.default_permissions(manage_guild=True)
+async def cmd_break(interaction: discord.Interaction):
+    global goma_break
+    goma_break = True
+    await interaction.response.send_message(
+        "全チャンネルで黙ります。個別の設定は覚えたままです。再開は `/breakout` です。")
+
+
+@tree.command(name="breakout", description="全チャンネルでの発言停止を解除する")
+@app_commands.default_permissions(manage_guild=True)
+async def cmd_breakout(interaction: discord.Interaction):
+    global goma_break
+    goma_break = False
+    off = f"\n黙る設定のチャンネル: {len(goma_channel_off)}個" if goma_channel_off else ""
+    await interaction.response.send_message(
+        "全チャンネルでの発言を再開します(チャンネルごとの個別設定はそのまま)。" + off)
+
+
 @client.event
 async def on_ready():
     log.info("ログインしました: %s (参加サーバー数: %d)", client.user, len(client.guilds))
+    try:
+        await tree.sync()
+        log.info("スラッシュコマンドを同期しました")
+    except Exception:
+        log.exception("スラッシュコマンドの同期に失敗しました")
     _load_greet_state()
     if not monologue_loop.is_running():
         monologue_loop.start()
