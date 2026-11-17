@@ -5,3 +5,4 @@ janome>=0.5
 jaconv>=0.3
 alkana
 httpx>=0.27
+pandas>=2.0

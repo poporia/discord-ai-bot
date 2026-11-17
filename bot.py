@@ -20,6 +20,17 @@ from discord.ext import tasks
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
+load_dotenv()
+
+# 2体同時起動対応: BOT_ENV_PREFIX=B2 で起動すると、B2_xxx という環境変数を
+# xxx として使う(例: B2_DISCORD_TOKEN→DISCORD_TOKEN)。bot.py は同一ファイルのまま、
+# トークンと人格だけ違う2体を1つのRenderサービスで動かせる。
+_BOT_PREFIX = os.environ.get("BOT_ENV_PREFIX", "").strip().rstrip("_")
+if _BOT_PREFIX:
+    for _k, _v in list(os.environ.items()):
+        if _k.startswith(_BOT_PREFIX + "_") and len(_k) > len(_BOT_PREFIX) + 1:
+            os.environ[_k[len(_BOT_PREFIX) + 1:]] = _v
+
 try:
     import gomamayo
 except ImportError:
@@ -35,7 +46,10 @@ try:
 except ImportError:
     songdb = None
 
-load_dotenv()
+try:
+    import bsky
+except ImportError:
+    bsky = None
 
 # ---------------- 設定(.env で上書き可能) ----------------
 DISCORD_TOKEN = os.environ["DISCORD_TOKEN"]  # 必須
@@ -52,6 +66,8 @@ INTERJECT_COOLDOWN = float(os.environ.get("INTERJECT_COOLDOWN", "90"))  # 同一
 GOMAMAYO_PROB = float(os.environ.get("GOMAMAYO_PROB", "0.5"))      # ゴママヨ検出時に返信する確率(絵文字は常に)
 GOMAMAYO_COOLDOWN = float(os.environ.get("GOMAMAYO_COOLDOWN", "60"))    # 同一チャンネルの最短ゴママヨ返信間隔(秒)
 GOMAMAYO_EMOJI = os.environ.get("GOMAMAYO_EMOJI", "⁉️")            # ゴママヨ検出時のリアクション
+GOMAMAYO_MESSAGE = os.environ.get("GOMAMAYO_MESSAGE", "それ、ゴママヨですよ⁉")  # 指摘文。{n}=次数 {w}=発生区間 を使える
+GOMAMAYO_ONLY = os.environ.get("GOMAMAYO_ONLY", "0") == "1"        # ゴママヨ検出専門ボットとして動かす(雑談なし)
 AUTO_REPLY = os.environ.get("AUTO_REPLY", "1") == "1"              # トリガー外でも、自分で「参加したい」と判断したら返す
 AUTO_REPLY_COOLDOWN = float(os.environ.get("AUTO_REPLY_COOLDOWN", "90"))  # 自発返信の最短間隔(秒・チャンネルごと)
 MONOLOGUE = os.environ.get("MONOLOGUE", "1") == "1"                # ごくまれにひとりごとを言う
@@ -69,6 +85,9 @@ GREETINGS = os.environ.get("GREETINGS", "1") == "1"    # 朝の挨拶・夜の�
 GREET_MORNING_HOURS = os.environ.get("GREET_MORNING_HOURS", "5-12")   # 日本時間の窓(この時間帯のどこかで1回)
 GREET_NIGHT_HOURS = os.environ.get("GREET_NIGHT_HOURS", "22-3")       # 22時〜翌3時(日をまたぐ)
 GREET_STATE_FILE = os.environ.get("GREET_STATE_FILE", "greeting_state.json")
+BSKY_MONOLOGUE = os.environ.get("BSKY_MONOLOGUE", "1") == "1"  # BlueskyのTLをあさって独り言を呟く
+BSKY_MONOLOGUE_PROB = float(os.environ.get("BSKY_MONOLOGUE_PROB", "0.15"))  # 30分ごとの判定で実行する確率
+BSKY_MONOLOGUE_COOLDOWN = float(os.environ.get("BSKY_MONOLOGUE_COOLDOWN", "7200"))  # 最短間隔(秒)
 MAX_CONTEXT = int(os.environ.get("MAX_CONTEXT", "10"))             # 文脈として読む直近メッセージ数
 MAX_REPLY_CHARS = int(os.environ.get("MAX_REPLY_CHARS", "300"))    # 返信の最大文字数
 
@@ -82,7 +101,7 @@ DEFAULT_PERSONA = (
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("ai-bot")
+log = logging.getLogger("ai-bot" + (f"/{_BOT_PREFIX}" if _BOT_PREFIX else ""))
 
 ai = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
 
@@ -97,6 +116,7 @@ last_auto: dict[int, float] = {}
 learn_enabled: dict[int, bool] = {}  # チャンネルごとの学習ON/OFF(!ai learn off)
 allowed_channels: set[int] = set(ALLOWED_CHANNEL_IDS)  # 発言許可チャンネル(Envで固定 or メンションで自動追加)
 last_monologue = 0.0          # 最後にひとりごと言った時刻
+last_bsky_monologue = 0.0     # 最後にBlueskyで呟いた時刻
 last_seen_channel = None      # 人間が最後に発言したチャンネル
 last_seen_time = 0.0          # その時刻
 human_msg_count = 0           # 学習トリガー用カウンタ
@@ -252,24 +272,31 @@ async def update_memory(channel):
 
 
 async def generate_monologue(channel):
-    """ひとりごと生成: 誰宛でもない、ぼそっと一言"""
+    """ひとりごと生成: チャンネルのタイムラインを漁って、気になった話題にぼそっと一言"""
     try:
         mono_sys = (load_persona()
                     + "\nいま誰もあなたに話しかけていません。返事ではなく、"
-                      "ぼそっとひとりごと言ってください。"
+                      "下のタイムライン(最近の会話)を眺めて、"
+                      "あなたが気になった話題に軽く反応する独り言を言ってください。"
                       "ルール: 1〜2文・日本語・名前やプレフィックスなし・"
-                      "誰かの発言への返答にしない。直近の話題をふと思い出す感じでOK。")
+                      "誰かへの返信の形にしない・毎回違う話題を拾う(ランダム感)。"
+                      "拾うネタがマンネリしないよう、直近の発言から自由に選んでOK。")
         notes = learned_notes()
         if notes:
             mono_sys += "\n\n【身につけた記憶(口調や話題として染み込ませる)】\n" + notes
         msgs = [{"role": "system", "content": mono_sys}]
-        history = [m async for m in channel.history(limit=5)]
-        ctx = "\n".join(f"{m.author.display_name}「{clean(m.content)}」"
-                        for m in reversed(history) if m.content)
+        # TLを漁る: 直近50件を読み、空メッセージを除いて短めに切り詰める
+        history = [m async for m in channel.history(limit=50)]
+        ctx = "\n".join(f"{m.author.display_name}「{clean(m.content)[:80]}」"
+                        for m in reversed(history)
+                        if m.content and not m.author.bot)
+        if len(ctx) > 1200:
+            ctx = ctx[-1200:]  # 新しめの会話を優先
         if ctx:
             msgs.append({"role": "user", "content":
-                         f"チャンネルの最近の様子:\n{ctx}\n\n"
-                         "(返信ではなく、あなたのひとりごとだけを出力)"})
+                         f"タイムライン:\n{ctx}\n\n"
+                         "(この中から気になった話題を1つ拾い、"
+                         "あなたの独り言だけを出力)"})
         resp = await ai.chat.completions.create(
             model=LLM_MODEL, messages=msgs, max_tokens=100, temperature=1.1)
         text = (resp.choices[0].message.content or "").strip()
@@ -397,6 +424,50 @@ async def greeting_loop():
             greet_plan[kind] = None
 
 
+async def generate_bsky_monologue() -> str | None:
+    """BlueskyのTLをあさって独り言を生成"""
+    try:
+        posts = await asyncio.to_thread(bsky.timeline, 30)
+        sys_text = (load_persona()
+                    + "\nBlueskyに独り言を呟いてください。"
+                      "下はあなたのタイムライン(フォローしている人の最近の投稿)です。"
+                      "その中から気になった話題を1つ拾い、軽く反応する独り言を書いてください。"
+                      "ルール: 1〜2文・日本語・名前やプレフィックスなし・"
+                      "誰かへの@リプライにしない・毎回違うネタを拾う。"
+                      "TLがつまらなければ全然関係ない思い付きでもOK。")
+        notes = learned_notes()
+        if notes:
+            sys_text += "\n\n【身につけた記憶(口調として染み込ませる)】\n" + notes
+        msgs = [{"role": "system", "content": sys_text}]
+        if posts:
+            msgs.append({"role": "user", "content":
+                         "タイムライン:\n" + "\n".join(posts[:25])
+                         + "\n\n(気になったネタを拾い、独り言だけを出力)"})
+        resp = await ai.chat.completions.create(
+            model=LLM_MODEL, messages=msgs, max_tokens=100, temperature=1.1)
+        text = (resp.choices[0].message.content or "").strip()
+        return text or None
+    except Exception:
+        log.exception("Bluesky独り言の生成に失敗しました")
+        return None
+
+
+@tasks.loop(minutes=30)
+async def bsky_monologue_loop():
+    """BlueskyのTLをあさって、ごくまれに(数時間に1回)呟く"""
+    global last_bsky_monologue
+    if not (BSKY_MONOLOGUE and bsky and bsky.enabled()):
+        return
+    if time.time() - last_bsky_monologue < BSKY_MONOLOGUE_COOLDOWN:
+        return
+    if random.random() > BSKY_MONOLOGUE_PROB:
+        return
+    text = await generate_bsky_monologue()
+    if text and await asyncio.to_thread(bsky.post, text):
+        last_bsky_monologue = time.time()
+        log.info("Blueskyに独り言を投稿しました")
+
+
 @tasks.loop(minutes=10)
 async def monologue_loop():
     """10分おきにサイコロを振り、ごくまれにひとりごとを言う"""
@@ -420,6 +491,32 @@ async def monologue_loop():
         last_monologue = time.time()
 
 
+async def gomamayo_check(ch, message: discord.Message) -> bool:
+    """ゴママヨ検出: ヒットしたら⁉️+指摘文。何か送信したら True"""
+    if gomamayo is None:
+        return False
+    df = (gomamayo.detect(message.content)
+          if interject_enabled.get(ch.id, True) else None)
+    if df is None:
+        return False
+    try:
+        await message.add_reaction(GOMAMAYO_EMOJI)
+    except discord.HTTPException:
+        pass
+    # 指摘するのは確率+クールダウン制(連発防止)
+    if (time.time() - last_gomamayo.get(ch.id, 0) >= GOMAMAYO_COOLDOWN
+            and random.random() <= GOMAMAYO_PROB):
+        last_gomamayo[ch.id] = time.time()
+        n = int(df.iloc[0]["次数"])
+        w = str(df.iloc[0]["ゴママヨ発生区間"])
+        try:
+            out = GOMAMAYO_MESSAGE.format(n=n, w=w)
+        except Exception:  # テンプレの中身がおかしくても素の文で送る
+            out = GOMAMAYO_MESSAGE
+        await ch.send(out)
+    return True
+
+
 @client.event
 async def on_ready():
     log.info("ログインしました: %s (参加サーバー数: %d)", client.user, len(client.guilds))
@@ -428,6 +525,9 @@ async def on_ready():
         monologue_loop.start()
     if not greeting_loop.is_running():
         greeting_loop.start()
+    if bsky and bsky.enabled() and not bsky_monologue_loop.is_running():
+        bsky_monologue_loop.start()
+        log.info("Bluesky独り言ループを開始しました(%s)", "設定済み")
 
 
 @client.event
@@ -449,6 +549,11 @@ async def on_message(message: discord.Message):
     if LEARN and learn_enabled.get(ch.id, True) and human_msg_count >= LEARN_EVERY:
         human_msg_count = 0
         asyncio.create_task(update_memory(ch))
+
+    # ゴママヨ検出専門ボット(GOMAMAYO_ONLY=1)は検出だけして終わり
+    if GOMAMAYO_ONLY:
+        await gomamayo_check(ch, message)
+        return
 
     # チャンネル内コマンド
     if message.content.strip().startswith("!ai"):
@@ -484,8 +589,9 @@ async def on_message(message: discord.Message):
             mono = "使える" if MONOLOGUE else "オフ"
             learn = "使える" if LEARN else "オフ"
             greet = "使える" if GREETINGS else "オフ"
+            bsky_st = "使える" if (bsky and bsky.enabled()) else "未設定"
             await ch.send(f"稼働中 / このチャンネルで喋る: {talk} / このチャンネルを学習: {learn_ch} / このチャンネルの発言: {allow}{fixed}\n"
-                          f"全体設定 / ゴママヨ検出: {goma} / ひとりごと: {mono} / 学習: {learn} / 挨拶: {greet}\n"
+                          f"全体設定 / ゴママヨ検出: {goma} / ひとりごと: {mono} / 学習: {learn} / 挨拶: {greet} / Bluesky: {bsky_st}\n"
                           "コマンド: `!ai off` `!ai on` `!ai here` `!ai hide` `!ai learn off` `!ai learn on`")
         return
 
@@ -509,40 +615,9 @@ async def on_message(message: discord.Message):
                 await ch.send(reply)
                 return
 
-    # 1.5) ゴママヨ検出(LLM不要・即座に反応)
-    if gomamayo is not None:
-        # ランキング / ランダム再生コマンド
-        if message.content.strip().startswith("!gomamayo"):
-            arg = message.content.strip()[len("!gomamayo"):].strip()
-            if arg in ("random", "r", "ランダム"):
-                e = gomamayo.random_one(message.guild.id)
-                if e:
-                    await ch.send(f"過去のゴママヨ: 「{e['text']}」\n"
-                                  f"（{e['a']}＋{e['b']} / {e['level']} / by {e['name']}）")
-                else:
-                    await ch.send("まだ記録されたゴママヨがありません。")
-            else:
-                await ch.send(gomamayo.ranking(message.guild.id, message.author.id))
-            return
-        hit = (gomamayo.detect(message.content)
-               if interject_enabled.get(ch.id, True) else None)
-        if hit:
-            try:
-                await message.add_reaction(GOMAMAYO_EMOJI)
-            except discord.HTTPException:
-                pass
-            # ツッコむ(=スコアが発表される)ときだけ得点が入る
-            if (time.time() - last_gomamayo.get(ch.id, 0) >= GOMAMAYO_COOLDOWN
-                    and random.random() <= GOMAMAYO_PROB):
-                last_gomamayo[ch.id] = time.time()
-                extra = ""
-                awarded = gomamayo.award(message.guild.id, message.author.id,
-                                         message.author.display_name, hit)
-                if awarded:
-                    pts, total = awarded
-                    extra = f"【+{pts}点、通計{total}点】"
-                await ch.send(f"それ{hit['level']}では？（「{hit['a']}」＋「{hit['b']}」）{extra}")
-            return
+    # 1.5) ゴママヨ検出(LLM不要・即座に反応。スコアリングなし・指摘のみ)
+    if await gomamayo_check(ch, message):
+        return
 
     # 2) 呼ばれたら必ず返信(そのチャンネルが発言許可リストに入る)
     if is_addressed_to_bot(message):
@@ -605,9 +680,11 @@ def _start_health_server():
         def log_message(self, *a):
             pass
 
-    t = threading.Thread(
-        target=HTTPServer(("0.0.0.0", port), Health).serve_forever, daemon=True)
-    t.start()
+    try:
+        srv = HTTPServer(("0.0.0.0", port), Health)
+    except OSError:
+        return  # 2体目など、ポートが既に使われている場合は何もしない
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
     log.info("ヘルスチェックサーバーを port %d で起動", port)
 
 
