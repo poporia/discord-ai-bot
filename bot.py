@@ -567,6 +567,79 @@ async def cmd_breakout(interaction: discord.Interaction):
         "全チャンネルでの発言を再開します(チャンネルごとの個別設定はそのまま)。" + off)
 
 
+# ---- 意見フォーム(/feedback: 誰でも送信可) ----
+# 意見の転記先。未設定なら「そのサーバーでボットが発言できる最初のチャンネル」へ送る
+FEEDBACK_CHANNEL_ID = int(os.environ.get("FEEDBACK_CHANNEL_ID", "0") or 0)
+
+
+class FeedbackModal(discord.ui.Modal):
+    def __init__(self, genre_name: str, genre_value: str):
+        super().__init__(title="意見フォーム(900文字まで)")
+        self.genre_name = genre_name
+        self.genre_value = genre_value
+        if genre_value == "miss":  # 検出されなかったゴママヨ
+            self.word = discord.ui.TextInput(
+                label="見逃されたゴママヨの言葉",
+                placeholder="例: レモンの embrace",
+                max_length=100,
+            )
+            self.body = discord.ui.TextInput(
+                label="補足(あれば)",
+                style=discord.TextStyle.paragraph,
+                required=False,
+                max_length=900,
+            )
+        else:  # その他の意見
+            self.word = discord.ui.TextInput(
+                label="対象(ボットの機能名など・任意)",
+                required=False,
+                max_length=100,
+            )
+            self.body = discord.ui.TextInput(
+                label="意見・要望",
+                style=discord.TextStyle.paragraph,
+                max_length=900,
+            )
+        self.add_item(self.word)
+        self.add_item(self.body)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        # 転記先: FEEDBACK_CHANNEL_ID 指定 → なければ送れる最初のチャンネル
+        dest = interaction.client.get_channel(FEEDBACK_CHANNEL_ID) if FEEDBACK_CHANNEL_ID else None
+        if dest is None and interaction.guild is not None:
+            for ch in interaction.guild.text_channels:
+                p = ch.permissions_for(interaction.guild.me)
+                if p.view_channel and p.send_messages:
+                    dest = ch
+                    break
+        if dest is None:
+            await interaction.response.send_message("転記先チャンネルが見つかりませんでした。", ephemeral=True)
+            return
+        e = discord.Embed(title="意見フォーム", color=0xE67E22)
+        e.add_field(name="ジャンル", value=self.genre_name, inline=False)
+        e.add_field(name=self.word.label, value=(self.word.value or "-")[:1000], inline=False)
+        e.add_field(name="内容", value=(self.body.value or "-")[:1000], inline=False)
+        e.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
+        e.timestamp = discord.utils.utcnow()
+        try:
+            await dest.send(embed=e)
+        except discord.Forbidden:
+            await interaction.response.send_message("転記先で発言できないため送れませんでした。", ephemeral=True)
+            return
+        log.info("意見フォームを受信: %s / %s", self.genre_name, interaction.user)
+        await interaction.response.send_message("送信しました!ありがとうございます✍", ephemeral=True)
+
+
+@tree.command(name="feedback", description="ボットへの意見をフォームで送る(全員OK)")
+@app_commands.describe(genre="意見のジャンルを選んでね")
+@app_commands.choices(genre=[
+    app_commands.Choice(name="ゴママヨなのに検出されなかった", value="miss"),
+    app_commands.Choice(name="その他の意見", value="other"),
+])
+async def cmd_feedback(interaction: discord.Interaction, genre: app_commands.Choice[str]):
+    await interaction.response.send_modal(FeedbackModal(genre.name, genre.value))
+
+
 @client.event
 async def on_ready():
     log.info("ログインしました: %s (参加サーバー数: %d)", client.user, len(client.guilds))
