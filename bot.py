@@ -570,9 +570,13 @@ async def cmd_breakout(interaction: discord.Interaction):
 @client.event
 async def on_ready():
     log.info("ログインしました: %s (参加サーバー数: %d)", client.user, len(client.guilds))
+    # スラッシュコマンド同期: グローバル同期は反映が最大1時間かかるため、
+    # 参加している全サーバーにコピーして即時反映させる(公式推奨の guild sync)
     try:
-        await tree.sync()
-        log.info("スラッシュコマンドを同期しました")
+        for g in client.guilds:
+            tree.copy_global_to(guild=discord.Object(id=g.id))
+            await tree.sync(guild=discord.Object(id=g.id))
+        log.info("スラッシュコマンドを同期しました(%dサーバー)", len(client.guilds))
     except Exception:
         log.exception("スラッシュコマンドの同期に失敗しました")
     _load_greet_state()
