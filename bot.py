@@ -507,10 +507,14 @@ async def gomamayo_check(ch, message: discord.Message) -> bool:
     if (time.time() - last_gomamayo.get(ch.id, 0) >= GOMAMAYO_COOLDOWN
             and random.random() <= GOMAMAYO_PROB):
         last_gomamayo[ch.id] = time.time()
-        n = int(df.iloc[0]["次数"])
-        w = str(df.iloc[0]["ゴママヨ発生区間"])
+        # {n}=次数 {w}=区間 {a}=前単語 {b}=後単語 を使える
+        n, w, a, b = (int(df.iloc[0]["次数"]),
+                      str(df.iloc[0]["ゴママヨ発生区間"]), "", "")
+        pl = gomamayo.parts(message.content)
+        if pl:
+            n, w, a, b = pl[0]
         try:
-            out = GOMAMAYO_MESSAGE.format(n=n, w=w)
+            out = GOMAMAYO_MESSAGE.format(n=n, w=w, a=a, b=b)
         except Exception:  # テンプレの中身がおかしくても素の文で送る
             out = GOMAMAYO_MESSAGE
         await ch.send(out)
