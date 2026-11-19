@@ -578,8 +578,9 @@ class FeedbackModal(discord.ui.Modal):
         self.genre_name = genre_name
         self.genre_value = genre_value
         if genre_value == "miss":  # 検出されなかったゴママヨ
+            self.word_label = "見逃されたゴママヨの言葉"
             self.word = discord.ui.TextInput(
-                label="見逃されたゴママヨの言葉",
+                label=self.word_label,
                 placeholder="例: レモンの embrace",
                 max_length=100,
             )
@@ -590,8 +591,9 @@ class FeedbackModal(discord.ui.Modal):
                 max_length=900,
             )
         else:  # その他の意見
+            self.word_label = "対象(ボットの機能名など)"
             self.word = discord.ui.TextInput(
-                label="対象(ボットの機能名など・任意)",
+                label=self.word_label,
                 required=False,
                 max_length=100,
             )
@@ -617,7 +619,7 @@ class FeedbackModal(discord.ui.Modal):
             return
         e = discord.Embed(title="意見フォーム", color=0xE67E22)
         e.add_field(name="ジャンル", value=self.genre_name, inline=False)
-        e.add_field(name=self.word.label, value=(self.word.value or "-")[:1000], inline=False)
+        e.add_field(name=self.word_label, value=(self.word.value or "-")[:1000], inline=False)
         e.add_field(name="内容", value=(self.body.value or "-")[:1000], inline=False)
         e.set_author(name=str(interaction.user), icon_url=interaction.user.display_avatar.url)
         e.timestamp = discord.utils.utcnow()
