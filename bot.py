@@ -119,6 +119,9 @@ goma_channel_off: set[int] = set()  # /channelsetting off されたチャンネ�
 last_auto: dict[int, float] = {}
 learn_enabled: dict[int, bool] = {}  # チャンネルごとの学習ON/OFF(!ai learn off)
 allowed_channels: set[int] = set(ALLOWED_CHANNEL_IDS)  # 発言許可チャンネル(Envで固定 or メンションで自動追加)
+
+# botの心拍(フリーズ検出用): Discordのイベントを処理するたびに更新される
+LAST_BEAT = {"t": time.time()}
 last_monologue = 0.0          # 最後にひとりごと言った時刻
 last_bsky_monologue = 0.0     # 最後にBlueskyで呟いた時刻
 last_seen_channel = None      # 人間が最後に発言したチャンネル
@@ -645,6 +648,7 @@ async def cmd_feedback(interaction: discord.Interaction, genre: app_commands.Cho
 @client.event
 async def on_ready():
     log.info("ログインしました: %s (参加サーバー数: %d)", client.user, len(client.guilds))
+    LAST_BEAT["t"] = time.time()
     # スラッシュコマンド同期:
     # 1) 過去にグローバル同期して残った重複を掃除(空リストを同期して削除)
     # 2) 参加サーバーごとに同期(グローバル同期は反映が最大1時間かかるため)
@@ -673,6 +677,7 @@ async def on_ready():
 
 @client.event
 async def on_message(message: discord.Message):
+    LAST_BEAT["t"] = time.time()
     if message.author.bot or message.guild is None:
         return
     ch = message.channel
@@ -814,9 +819,13 @@ def _start_health_server():
 
     class Health(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200)
+            # bot本体の心拍を監視: 10分以上無応答(フリーズ)なら 500 を返して
+            # Renderのヘルスチェック失敗 → 自動再起動を誘発させる
+            alive = (time.time() - LAST_BEAT["t"]) < 600
+            code = 200 if alive else 500
+            self.send_response(code)
             self.end_headers()
-            self.wfile.write(b"ok")
+            self.wfile.write(b"ok" if alive else b"stalled")
 
         def log_message(self, *a):
             pass
