@@ -1,6 +1,5 @@
 import re
 from janome.tokenizer import Tokenizer
-import pandas as pd
 import discord
 
 
@@ -8,7 +7,7 @@ import discord
 
 gtoken = Tokenizer("./libs/dic/user_dic.csv", udic_type="simpledic", udic_enc="utf8")
 
-                   
+
 def gomamayo(text):
     text = re.sub(r'\[|\]|\(|\)|「|」', '。', text)
     wlist = []
@@ -55,39 +54,22 @@ def gomajoin(step1):
 
 
 def totable(tlist):
-    gomaresult = [[],[],[]]
+    # (次数, ゴママヨ発生区間) のリストを返す(旧pandas表の代替・軽量)
+    rows = []
     for goma in tlist:
         size = goma[1] - goma[0] - 1
         if size > 2:
             size = 2
-        gomaresult[size].append([goma[2],goma[3]+goma[4]])
-  
-    df = pd.DataFrame(gomaresult[0],columns=["次数","ゴママヨ発生区間"])
-    df1 = pd.DataFrame(gomaresult[1],columns=["次数","ゴママヨ発生区間"])
-    df2 = pd.DataFrame(gomaresult[2],columns=["次数","ゴママヨ発生区間"])
+        rows.append((goma[2], goma[3] + goma[4]))
+    rows.sort(key=lambda r: r[0])
+    return rows or None
 
-    dx = []
-    if not(df.empty):
-        dx.append(df)
-    
-    if not(df1.empty):
-        dx.append(df1)
 
-    if not(df2.empty):
-        dx.append(df2)
-    
-    if len(dx) == 0:
-        return None
-    else:
-        dfa = pd.concat(dx,axis=0,ignore_index=True)
-        return dfa
-    
-
-def goma_em(df:pd.DataFrame)->"discord.Embed|None":
-        if (df is not None )and(len(df) != 0):
+def goma_em(rows)->"discord.Embed|None":
+        if rows:
             embed = discord.Embed(title = "ゴママヨ found!!!")
-            for row in df.itertuples():
-                embed.add_field(name=str(row[1])+"次",value=row[2],inline=False)
+            for count, span in rows:
+                embed.add_field(name=str(count)+"次",value=span,inline=False)
             return embed
         else:
             return None

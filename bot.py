@@ -122,6 +122,19 @@ allowed_channels: set[int] = set(ALLOWED_CHANNEL_IDS)  # 発言許可チャン�
 
 # botの心拍(フリーズ検出用): Discordのイベントを処理するたびに更新される
 LAST_BEAT = {"t": time.time()}
+
+
+# メモリ使用量を10分おきにLogsへ出力(Render無料枠はMetricsが見れないため)
+@tasks.loop(minutes=10)
+async def memory_report_loop():
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS"):
+                    log.info("メモリ使用量: %s", line.split(":", 1)[1].strip())
+                    break
+    except OSError:
+        pass
 last_monologue = 0.0          # 最後にひとりごと言った時刻
 last_bsky_monologue = 0.0     # 最後にBlueskyで呟いた時刻
 last_seen_channel = None      # 人間が最後に発言したチャンネル
@@ -517,11 +530,12 @@ async def gomamayo_check(ch, message: discord.Message) -> bool:
             and random.random() <= GOMAMAYO_PROB):
         last_gomamayo[ch.id] = time.time()
         # {n}=次数 {w}=区間 {a}=前単語 {b}=後単語 を使える
-        n, w, a, b = (int(df.iloc[0]["次数"]),
-                      str(df.iloc[0]["ゴママヨ発生区間"]), "", "")
+        n, w, a, b = ("", "", "", "")
         pl = gomamayo.parts(message.content)
         if pl:
             n, w, a, b = pl[0]
+        elif df:
+            n, w = df[0][0], df[0][1]
         try:
             out = GOMAMAYO_MESSAGE.format(n=n, w=w, a=a, b=b)
         except Exception:  # テンプレの中身がおかしくても素の文で送る
@@ -666,6 +680,8 @@ async def on_ready():
     except Exception:
         log.exception("スラッシュコマンドの同期に失敗しました")
     _load_greet_state()
+    if not memory_report_loop.is_running():
+        memory_report_loop.start()
     if not monologue_loop.is_running():
         monologue_loop.start()
     if not greeting_loop.is_running():
